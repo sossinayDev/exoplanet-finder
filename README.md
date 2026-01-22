@@ -1,2 +1,4 @@
 # exoplanet-finder
-Finding exoplanets using TESS-data, Lightkurve and Python.
+
+## What is this?
+This program will be able to identify, track and analyse Exoplanets programmatically.
