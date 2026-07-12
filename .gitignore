@@ -3,3 +3,5 @@ etc/*
 Include/*
 Scripts/*
 share/*
+linux-venv/*
+measurements/*
