@@ -7,8 +7,17 @@ matplotlib.use("QtAgg")
 import lightkurve as lk
 from datetime import datetime
 from colorama import Fore
+import time
 from time import time
 import astropy.units as u
+from rich.progress import Progress # Q: https://www.geeksforgeeks.org/python/progress-bars-in-python/
+
+def pct_to_mmag(depth_pct):
+    depth_pct = 1.60277
+    flux_ratio = 1 - depth_pct/100
+
+    delta_mag = -2.5 * np.log10(flux_ratio) * u.mag
+    return delta_mag.to(u.mmag)
 
 def strfunix(unix,string:str="%d/%m/%Y - %H:%M:%S"):
     return datetime.fromtimestamp(unix).strftime(string)
@@ -69,11 +78,17 @@ class transit:
         data_range = self.values[self.start_index:self.end_index]
         data_range.sort()
         
-        average_minimum_value = sum(data_range[1:int(len(data_range)/4)])/int(len(data_range)/4-1) # Average of the lowest third of vals, excluding 1 outlier
+        lowest_quarter = data_range[:int(len(data_range)*5/100)]
+        average_minimum_value = data_range[0]
+        if len(lowest_quarter) > 2:
+            average_minimum_value = sum(lowest_quarter)/len(lowest_quarter) # Average of the lowest 2% of vals
+            
 
         self.depth = (self.noise_range[0]+self.noise_range[1])/2-average_minimum_value
 
+        self.duration_s = self.end - self.start
         self.analyzed = True
+
     
     def save(self):
         return {
@@ -436,7 +451,7 @@ Measurement {self.target}#{self.index}
                     s = t.start
                     e = t.end
                     t_array.append((s,e-s))
-                    plt.text(s,self.noise_range[1]+0.005,f"T#{i}")
+                    plt.text(s,self.noise_range[1]+0.005,f"T#{i}\nD: {(t.depth*100):.4}%")
                     plt.broken_barh([(s,e-s)], (avg_y - t.depth,0.0001), color='green')
                     i += 1
                 plt.broken_barh(t_array, (1, 0.1), align="center", color=(0.3,0.3,0.5,0.3))
@@ -482,6 +497,7 @@ class star_observation:
     target = "TrES-3 b"
     MEASURMENT_RESULT_DIRECTORY = "./error"
     measurements = []
+    good_measurements = []
     log_debug = False
     log_warnings = True
     log_errors = True
@@ -489,6 +505,8 @@ class star_observation:
     merged_data_pairs = {}
 
     stopwatch_starts = {}
+    
+    progress = None
 
     calculated = False
 
@@ -502,6 +520,7 @@ class star_observation:
         self.measurement_depth = depth
         self.MEASURMENT_RESULT_DIRECTORY = f"/home/yanis/Nextcloud/000_School/Maturaarbeit/code/exoplanet-finder/measurements/{star_name}/"
         self.log_debug = debug
+        
     
     def set_log_params(self, debug, warn, error):
         self.log_debug = debug
@@ -509,6 +528,9 @@ class star_observation:
         self.log_errors = error
     
     def observe(self):
+        self.progress = Progress()
+        self.progress.start()
+        obs_prog = self.progress.add_task("Observing...",total=100)
         # Gets the desired amount measurements from the satellites (specified in self.measurement_depth)
         self.measurements = []
         self.log_dbg(f"Observing with a depth of {self.measurement_depth} measurements")
@@ -517,6 +539,8 @@ class star_observation:
         self.start_stopwatch(1)
         search = lk.search_targetpixelfile(self.target)
         self.log_dbg(f"  Search complete, time elapsed: {self.stop_stopwatch(label='Search time')}s")
+        self.progress.update(obs_prog, advance=20)
+        s = 80/self.measurement_depth
         for current_index in range(self.measurement_depth):
             self.log_dbg(f"  Getting measurement #{current_index}")
             current_measurement = None
@@ -530,23 +554,50 @@ class star_observation:
                 break
             self.log_dbg(f"  ... Created object")
             current_measurement.load_data_from_sat()
+            self.progress.update(obs_prog, advance=s/3)
             self.log_dbg(f"  ... Loaded data")
             current_measurement.parse()
             self.log_dbg(f"  ... Parsed data")
+            self.progress.update(obs_prog, advance=s/3)
             current_measurement.analyze()
             self.log_dbg(f"  ... Analyzed data")
+            self.progress.update(obs_prog, advance=s/3)
             self.measurements.append(current_measurement)
             self.log_dbg(f"  ... Stored data")
         self.log_dbg(f"Finished observing {self.target}. ")
+        self.progress.update(obs_prog, completed=100)
+        self.progress.stop()
     
+    def check_data(self):
+        if len(self.measurements) == 0: return
+        # Remove measurements with high period delta
+        allps = []
+        for m in self.measurements:
+            allps.append(m.period)
+        allps = remove_outliers(allps,int(len(allps)*0.3))
+        avg_period = sum(allps)/len(allps)
+
+        for m in self.measurements:
+            delta = abs(avg_period-m.period)
+            if delta < 0.5*u.hour:
+                self.good_measurements.append(m)
+
     def analyze_transits(self):
         # Check if there's enough data
-        print("MEASUREMENTS: ",self.measurements)
-        if len(self.measurements) == 0: return
+        if len(self.good_measurements) == 0: return
+
+        # Planet period analysis
+        allps = []
+        for m in self.good_measurements:
+            allps.append(m.period)
+        allps = remove_outliers(allps,int(len(allps)*0.3))
+        self.avg_period = sum(allps)/len(allps)
+
+
+
         ts = []
-        for m in self.measurements:
+        for m in self.good_measurements:
             ts += m.transits
-        print("TRANSITS: ",ts)
         if len(ts) == 0: return
 
         # Transit depth analysis
@@ -559,19 +610,14 @@ class star_observation:
             depths.append(t.depth)
             durations.append(t.duration_s)
         
-        depths = remove_outliers(depths)
+        depths = remove_outliers(depths,int(len(depths)*0.3))
         self.t_depth = sum(depths)/len(depths)
 
-        durations = remove_outliers(durations)
+        durations = remove_outliers(durations, int(len(durations)*0.3))
         self.t_duration = sum(durations)/len(durations)
 
 
 
-        # Planet period analysis
-        allps = []
-        for m in self.measurements:
-            allps.append(m.period)
-        self.avg_period = sum(allps)/len(allps)
 
         self.calculated = True
 
@@ -701,6 +747,8 @@ class star_observation:
         print(f"|   Loaded measurement data files:      {len(self.measurements)}/{self.measurement_depth}")
 
         for meas in self.measurements:
+            if not meas in self.good_measurements:
+                print(Fore.YELLOW,end="")
             print(f"|   @ Measurement # {meas.index}")
 
             print(f"|     Start:                            {meas.start()}")
@@ -738,11 +786,13 @@ class star_observation:
                 total += v
                 print(f"|      {k}: 		{round(v*1000000)/1000}ms")
             print(f"|      Total: 			{round(total*1000000)/1000}ms")
+
+            print(Fore.RESET,end="")
         print(f"[ ============================================================= ]")
         if self.calculated:
             print(f"|  Calculation results")
-            print(f"|    Avg. transit depth:    {self.t_depth*100:.5}%")
-            print(f"|    Avg. transit duration: {self.t_duration/60/24:.5}h")
+            print(f"|    Avg. transit depth:    {self.t_depth*100:.5}% / {pct_to_mmag(self.t_depth*100):.5}")
+            print(f"|    Avg. transit duration: {self.t_duration/60/60:.5}h / {self.t_duration/60} min")
             print(f"|    Avg. period:           {self.avg_period:.5}")
 
             print(f"[ ============================================================= ]")
